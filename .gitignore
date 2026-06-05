@@ -1,0 +1,60 @@
+# ─── Secretos / configuración local ─────────────────────────
+.env
+*.env
+!.env.example
+
+# ─── Datos runtime (no entran al repo) ──────────────────────
+data/
+*.db
+*.db-shm
+*.db-wal
+*.jsonl
+audio_clips/
+face_snaps/
+event_clips/
+metadata_archive/
+face_db.pkl
+
+# ─── Modelos (demasiado grandes / propietarios) ─────────────
+yolo/
+models/
+*.engine
+*.onnx
+*.pt
+*.tflite
+*.whl
+
+# ─── Python ─────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ─── IDEs ───────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ─── macOS / Windows ────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── Logs ───────────────────────────────────────────────────
+*.log
+logs/
+
+# ─── Docker ─────────────────────────────────────────────────
+.docker/
+
+# ─── Backups ────────────────────────────────────────────────
+*.bak
+*.bak.*
+*.orig

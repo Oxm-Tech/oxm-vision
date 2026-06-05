@@ -1,0 +1,61 @@
+services:
+  oxm-vision:
+    build: .
+    image: oxm-vision:latest
+    runtime: nvidia
+    privileged: true
+    network_mode: host
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    devices:
+      # Ajustar según los nodos /dev/video* asignados por v4l2-ctl --list-devices
+      - /dev/video0:/dev/video0  # USB Webcam (puede variar)
+      - /dev/video2:/dev/video2  # CSI IMX219 (puede variar)
+      - /dev/snd:/dev/snd
+    volumes:
+      # Modelos YOLO (.engine compilado en host)
+      - ${YOLO_DIR:-./yolo}:/yolo:ro
+
+      # Datos runtime (persisten entre rebuilds)
+      - ${DATA_DIR:-./data}/audio_clips:/app/audio_clips
+      - ${DATA_DIR:-./data}/unified_metadata.jsonl:/app/unified_metadata.jsonl
+      - ${DATA_DIR:-./data}/metadata_archive:/app/metadata_archive
+      - ${DATA_DIR:-./data}/event_clips:/app/event_clips
+      - ${DATA_DIR:-./data}/face_db.pkl:/app/face_db.pkl
+
+      # Socket de NVIDIA Argus (CSI camera)
+      - /tmp/argus_socket:/tmp/argus_socket
+
+      # Código fuente (hot-reload sin rebuild)
+      - ./src/main.py:/app/main.py
+      - ./src/dashboard.py:/app/dashboard.py
+      - ./src/face_reid.py:/app/face_reid.py
+      - ./src/pose.py:/app/pose.py
+      - ./src/db.py:/app/db.py
+      - ./src/event_recorder.py:/app/event_recorder.py
+      - ./assets/logo-oxmtech.png:/app/logo-oxmtech.png
+
+      # Libs del host (necesarias para GStreamer + NVIDIA en JetPack)
+      - /usr/lib/aarch64-linux-gnu/gstreamer-1.0:/usr/lib/aarch64-linux-gnu/gstreamer-1.0
+      - /usr/lib/aarch64-linux-gnu/nvidia:/usr/lib/aarch64-linux-gnu/host-nvidia
+
+      # Modelos InsightFace (descarga inicial automática)
+      - ${INSIGHTFACE_DIR:-./models/insightface}:/root/.insightface
+
+      # Cache de Whisper / HuggingFace
+      - ${WHISPER_CACHE:-./models/whisper_cache}:/root/.cache/huggingface
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - DISPLAY=
+      - EGL_PLATFORM=surfaceless
+      - LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu/host-nvidia:/usr/lib/aarch64-linux-gnu/nvidia
+      - "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}"
+      - "TELEGRAM_TOKEN=${TELEGRAM_TOKEN:-}"
+      - "TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}"
+      - "REPORT_HOUR_CST=${REPORT_HOUR_CST:-8}"
+    command: bash -c "sleep 5 && python3 main.py"

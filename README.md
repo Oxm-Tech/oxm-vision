@@ -4,8 +4,8 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Jetson](https://img.shields.io/badge/NVIDIA-Jetson%20Orin%20Nano-76b900)](https://www.nvidia.com/en-us/autonomous-machines/embedded-systems/jetson-orin/)
-[![JetPack](https://img.shields.io/badge/JetPack-R36.4-blue)]()
-[![CUDA](https://img.shields.io/badge/CUDA-12.8-green)]()
+[![JetPack](https://img.shields.io/badge/JetPack-R36.4-blue)](https://developer.nvidia.com/embedded/jetpack)
+[![CUDA](https://img.shields.io/badge/CUDA-12.8-green)](https://developer.nvidia.com/cuda-12-8-0-download-archive)
 
 ---
 

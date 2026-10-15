@@ -12,7 +12,7 @@ except ImportError:
     print("WARN: faiss no disponible, usando búsqueda lineal")
 
 DB_PATH       = '/app/face_db.pkl'
-THRESHOLD     = 0.35  # similitud mínima para match
+THRESHOLD     = 0.35   # 0.45 era demasiado estricto para distintos ángulos/iluminación
 EMB_ALPHA     = 0.15   # peso del embedding nuevo en EMA (aprendizaje gradual)
 EMB_DIM       = 512
 SAVE_INTERVAL = 30     # segundos entre writes a disco
@@ -20,9 +20,31 @@ SAVE_INTERVAL = 30     # segundos entre writes a disco
 class FaceReID:
     def __init__(self):
         available = onnxruntime.get_available_providers()
+        use_trt   = 'TensorrtExecutionProvider' in available
         use_cuda  = 'CUDAExecutionProvider' in available
 
-        if use_cuda:
+        if use_trt:
+            # TensorRT: mejor rendimiento en Jetson Orin (FP16 nativo)
+            os.makedirs('/tmp/trt_insightface', exist_ok=True)
+            trt_opts = {
+                'device_id': 0,
+                'trt_max_workspace_size': 256 * 1024 * 1024,
+                'trt_fp16_enable': True,
+                'trt_engine_cache_enable': True,
+                'trt_engine_cache_path': '/tmp/trt_insightface',
+            }
+            cuda_opts = {
+                'device_id': 0,
+                'arena_extend_strategy': 'kSameAsRequested',
+                'gpu_mem_limit': 256 * 1024 * 1024,
+            }
+            providers = [('TensorrtExecutionProvider', trt_opts),
+                         ('CUDAExecutionProvider', cuda_opts),
+                         'CPUExecutionProvider']
+            ctx_id = 0
+            self.mode = 'TRT'
+        elif use_cuda:
+            # CUDA: fallback si TRT no disponible
             # kSameAsRequested evita arena gigante que falla en Jetson con memoria fragmentada
             cuda_opts = {
                 'device_id': 0,
@@ -32,34 +54,63 @@ class FaceReID:
                 'do_copy_in_default_stream': True,
             }
             providers = [('CUDAExecutionProvider', cuda_opts), 'CPUExecutionProvider']
+            ctx_id = 0
+            self.mode = 'CUDA'
         else:
             providers = ['CPUExecutionProvider']
+            ctx_id = -1
+            self.mode = 'CPU'
 
+        self.on_gpu = self.mode != 'CPU'
         self.app = FaceAnalysis(providers=providers)
-        if use_cuda:
-            self.app.prepare(ctx_id=0, det_size=(320, 320))
-            print("FaceReID (GPU): det_size=320x320")
-        else:
-            self.app.prepare(ctx_id=-1, det_size=(320, 320))
-            print("FaceReID (CPU): det_size=320x320")
+        self.app.prepare(ctx_id=ctx_id, det_size=(320, 320))
+        print(f"FaceReID ({self.mode}): det_size=320x320")
 
-        self.db     = self._load_db()
-        self._dirty = False
-        self._lock  = threading.Lock()
+        self.db          = self._load_db()
+        self._dirty      = False
+        self._lock       = threading.Lock()
+        # InsightFace (self.app.get) no es thread-safe para llamadas concurrentes.
+        # Este lock serializa inferencias de CSI y USB reid_workers sobre el mismo objeto.
+        self._infer_lock = threading.Lock()
         self._build_index()
         print(f"FaceReID: {len(self.db)} personas en DB {'(FAISS)' if FAISS_OK else '(lineal)'}")
 
         threading.Thread(target=self._flush_loop, daemon=True).start()
 
     def _load_db(self):
-        if os.path.exists(DB_PATH):
-            with open(DB_PATH, 'rb') as f:
-                return pickle.load(f)
+        if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0:
+            try:
+                with open(DB_PATH, 'rb') as f:
+                    return pickle.load(f)
+            except (EOFError, pickle.UnpicklingError, Exception) as e:
+                print(f"[FaceReID] ERROR: face_db.pkl corrupto ({e}), "
+                      f"buscando backup más reciente...", flush=True)
+                backup = self._latest_backup()
+                if backup:
+                    print(f"[FaceReID] Restaurando desde {backup}", flush=True)
+                    with open(backup, 'rb') as f:
+                        return pickle.load(f)
+                print("[FaceReID] Sin backups disponibles, iniciando DB vacía", flush=True)
         return {}
 
+    def _latest_backup(self):
+        backup_dir = os.path.join(os.path.dirname(DB_PATH), 'backups')
+        if not os.path.isdir(backup_dir):
+            return None
+        candidates = sorted(
+            (f for f in os.listdir(backup_dir) if f.startswith('face_db_') and f.endswith('.pkl')),
+            reverse=True
+        )
+        return os.path.join(backup_dir, candidates[0]) if candidates else None
+
     def _save_db(self):
-        with open(DB_PATH, 'wb') as f:
+        # Write atómico: escribe a un .tmp y renombra — nunca deja DB_PATH
+        # a medio escribir si el proceso muere durante el dump (causa raíz
+        # de corrupción vista en producción: pkl truncado a 0 bytes).
+        tmp_path = DB_PATH + '.tmp'
+        with open(tmp_path, 'wb') as f:
             pickle.dump(self.db, f)
+        os.replace(tmp_path, DB_PATH)
         print(f"[FaceReID] DB guardada ({len(self.db)} personas)", flush=True)
 
     def _flush_loop(self):
@@ -96,7 +147,8 @@ class FaceReID:
     def identify(self, frame):
         """Retorna lista de {person_uuid, bbox, similarity, new}"""
         results = []
-        faces = self.app.get(frame)
+        with self._infer_lock:
+            faces = self.app.get(frame)
         for face in faces:
             emb = face.normed_embedding.astype('float32')
             best_id, best_sim = None, 0.0
@@ -140,25 +192,3 @@ class FaceReID:
                 'new': is_new
             })
         return results
-
-    def enroll(self, name: str, frame) -> dict:
-        """Enrolla una persona por nombre desde un frame BGR.
-        Usa la cara más grande detectada. Retorna {ok, name, faces_found} o {ok=False, error}."""
-        if not name or not name.strip():
-            return {'ok': False, 'error': 'Nombre vacío'}
-        name = name.strip()
-        try:
-            faces = self.app.get(frame)
-        except Exception as e:
-            return {'ok': False, 'error': f'Detección falló: {e}'}
-        if not faces:
-            return {'ok': False, 'error': 'No se detectó ningún rostro en el frame'}
-        # Usar cara más grande (mayor área de bbox)
-        face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-        emb  = face.normed_embedding.astype('float32')
-        with self._lock:
-            self.db[name] = emb
-            self._rebuild_index_unsafe()
-            self._dirty = True
-        print(f"[FaceReID] Enrolled: '{name}' ({len(faces)} cara(s) detectada(s))", flush=True)
-        return {'ok': True, 'name': name, 'faces_found': len(faces)}

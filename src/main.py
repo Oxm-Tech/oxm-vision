@@ -17,7 +17,6 @@ import subprocess
 import shutil
 import datetime
 import csv
-from scipy.signal import butter as _butter, sosfilt as _sosfilt, iirnotch as _iirnotch, lfilter as _lfilter
 import http.client
 import ssl
 try:
@@ -78,7 +77,7 @@ METADATA_ROTATE_CHECK_S = 3600
 AUDIO_DIR      = '/app/audio_clips'
 FACE_SNAPS_DIR = '/app/face_snaps'
 AUDIO_MAX_B   = 10 * 1024**3
-USB_IDX       = 1
+USB_IDX       = '/dev/v4l/by-id/usb-YGTek_Webcam_YG_U600D.4653_4K.2103121705-video-index0'  # symlink estable — la numeracion /dev/videoN cambia entre reboots
 AUDIO_CARD    = 0   # Webcam USB (hw:0,0) — pyalsaaudio cardindex
 RATE          = 16000
 CHUNK         = 15600
@@ -412,14 +411,7 @@ def transcribe_clip(path_opus, meta_ts, duration_s=120.0):
         return
     try:
         wm = _get_whisper()
-        segments, info = wm.transcribe(
-            path_opus,
-            language="es",
-            beam_size=3,
-            vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 500},
-            initial_prompt="Transcripción de reunión de negocios en español:",
-        )
+        segments, info = wm.transcribe(path_opus, language="es", beam_size=1)
         text = " ".join(s.text.strip() for s in segments).strip()
         if not text:
             print(f"[TRANSCRIPT] {os.path.basename(path_opus)}: sin habla detectada", flush=True)
@@ -431,29 +423,6 @@ def transcribe_clip(path_opus, meta_ts, duration_s=120.0):
             if single_char_ratio > 0.6:
                 print(f"[TRANSCRIPT] {os.path.basename(path_opus)}: descartado (alucinación Whisper: '{text[:40]}')", flush=True)
                 return
-        # Post-procesar con Nemotron: limpiar muletillas, corregir texto
-        try:
-            from openai import OpenAI as _OAI
-            _nemotron_url = os.environ.get('NEMOTRON_URL', 'http://localhost:8003/v1')
-            _nc = _OAI(base_url=_nemotron_url, api_key='none', timeout=30.0)
-            _nr = _nc.chat.completions.create(
-                model='nemotron-omni', max_tokens=600,
-                messages=[{
-                    'role': 'user',
-                    'content': (
-                        'Corrige y limpia esta transcripción de audio en español. '
-                        'Elimina muletillas ("eh", "um", "este", repeticiones), corrige '
-                        'errores de dictado y puntúa correctamente. '
-                        'Devuelve SOLO el texto corregido, sin explicaciones.\n\n'
-                        + text
-                    )
-                }]
-            )
-            text = _nr.choices[0].message.content.strip() or text
-            print(f"[TRANSCRIPT] Nemotron limpió transcripción", flush=True)
-        except Exception as _ne:
-            print(f"[TRANSCRIPT] Nemotron no disponible, usando Whisper raw: {_ne}", flush=True)
-
         txt_path = path_opus.replace('.opus', '.txt')
         with open(txt_path, 'w') as f:
             f.write(text)
@@ -631,11 +600,39 @@ def capture_csi():
         os.unlink(frame_path)
 
 # ── Captura USB ────────────────────────────────────────────────────────────────
+# Watchdog de 2 capas:
+# 1. _usb_last_read_ts — cap.read() puede quedar bloqueado indefinidamente sin
+#    retornar ni True ni False (condición de carrera con Argus/CSI al arrancar).
+# 2. _usb_last_good_frame_ts — el read puede seguir "vivo" (retorna rápido) pero
+#    fallando de forma intermitente lo suficiente para nunca llegar a los 10
+#    fallos seguidos ni colgarse del todo: cámara "viva" en apariencia pero sin
+#    entregar video real durante minutos u horas. Se vio en producción: 0 fps
+#    sostenido sin ningún log de error ni reconexión.
+# Un thread separado mata el proceso si cualquiera de las dos señales se estanca.
+_usb_last_read_ts = [time.time()]
+_usb_last_good_frame_ts = [time.time()]
+_usb_watchdog_timeout = 15
+_usb_stall_timeout = 20  # sin frame útil entregado en N segundos = cámara muerta de facto
+
+def _usb_watchdog():
+    while running:
+        time.sleep(5)
+        now = time.time()
+        if now - _usb_last_read_ts[0] > _usb_watchdog_timeout:
+            print(f"USB: watchdog — sin actividad por {_usb_watchdog_timeout}s, "
+                  f"forzando reinicio del proceso", flush=True)
+            os._exit(1)  # Docker restart=unless-stopped/always relanza el proceso
+        if now - _usb_last_good_frame_ts[0] > _usb_stall_timeout:
+            print(f"USB: watchdog — sin frame útil por {_usb_stall_timeout}s "
+                  f"(cámara viva pero estancada), forzando reinicio del proceso", flush=True)
+            os._exit(1)
+
 def capture_usb():
+    threading.Thread(target=_usb_watchdog, daemon=True).start()
     fail_count = 0
     while running:
         print("USB: abriendo cámara...")
-        cap = cv2.VideoCapture(USB_IDX, cv2.CAP_V4L2)
+        cap = cv2.VideoCapture(USB_IDX, cv2.CAP_V4L2)  # path fijo, no indice
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M','J','P','G'))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
@@ -643,15 +640,19 @@ def capture_usb():
         if not cap.isOpened():
             print("USB: ERROR no abre, reintentando en 5s")
             dashboard.set_cam_status('usb', False)
+            _usb_last_read_ts[0] = time.time()
             time.sleep(5)
             continue
         print("USB: OK")
         dashboard.set_cam_status('usb', True)
+        _usb_last_good_frame_ts[0] = time.time()
         fail_count = 0
         while running:
             ret, frame = cap.read()
+            _usb_last_read_ts[0] = time.time()
             if ret and frame is not None:
                 fail_count = 0
+                _usb_last_good_frame_ts[0] = time.time()
                 with lock:
                     frames['usb'] = frame
             else:
@@ -678,38 +679,23 @@ def set_mic_muted(muted: bool):
     print(f"[AUDIO] Micrófono {'silenciado' if muted else 'activado'}", flush=True)
 
 # ── Parámetros de calidad de audio ───────────────────────────────────────────
-_NOISE_GATE_RMS  = 0.004   # descarta silencio absoluto — bajo para no cortar voz lejana
-_GAIN_TARGET_RMS = 0.12    # más alto para compensar micrófono de webcam lejano
+_NOISE_GATE_RMS  = 0.003   # descarta frames de silencio absoluto
+_GAIN_TARGET_RMS = 0.06    # normaliza a este nivel RMS antes de YAMNet
 _PREEMPH_COEF    = 0.97    # pre-énfasis: realza frecuencias altas de voz
-_LIMITER_THRESH  = 0.85    # compresor suave: aplana picos por encima de este nivel
-
-# Filtro bandpass 100Hz–7kHz — elimina 60Hz (red eléctrica) y ruido alto
-_BP_SOS = _butter(4, [100 / (RATE / 2), 7000 / (RATE / 2)], btype='band', output='sos')
-# Notch 120Hz y 180Hz — armónicos de 60Hz que pasan el bandpass
-_N120_B, _N120_A = _iirnotch(120, Q=30, fs=RATE)
-_N180_B, _N180_A = _iirnotch(180, Q=30, fs=RATE)
 
 def _process_audio(raw_int16: bytes) -> np.ndarray:
-    """S16LE → float32: bandpass 100-7kHz, compresor suave, pre-énfasis, normalización."""
+    """Convierte bytes S16LE → float32, aplica pre-énfasis + normalización."""
     audio = np.frombuffer(raw_int16, dtype=np.int16).astype(np.float32) / 32768.0
     if len(audio) < CHUNK:
         audio = np.pad(audio, (0, CHUNK - len(audio)))
     else:
         audio = audio[:CHUNK]
-    # Bandpass: elimina 60Hz fundamental y ruido >7kHz
-    audio = _sosfilt(_BP_SOS, audio)
-    # Notch 120Hz y 180Hz: armónicos de zumbido eléctrico (60Hz red México)
-    audio = _lfilter(_N120_B, _N120_A, audio)
-    audio = _lfilter(_N180_B, _N180_A, audio)
-    # Compresor suave: aplana picos fuertes sin distorsionar
-    mask = np.abs(audio) > _LIMITER_THRESH
-    audio[mask] = np.sign(audio[mask]) * (_LIMITER_THRESH + np.tanh(np.abs(audio[mask]) - _LIMITER_THRESH) * (1 - _LIMITER_THRESH))
-    # Pre-énfasis: realza consonantes y frecuencias altas de voz
+    # Pre-énfasis: y[n] = x[n] - α·x[n-1]
     audio = np.append(audio[0], audio[1:] - _PREEMPH_COEF * audio[:-1])
-    # Normalización: gain alto para compensar micrófono lejano
+    # Normalización de volumen
     rms = float(np.sqrt(np.mean(audio ** 2)))
     if rms > _NOISE_GATE_RMS:
-        gain = min(_GAIN_TARGET_RMS / rms, 15.0)
+        gain = min(_GAIN_TARGET_RMS / rms, 8.0)
         audio = audio * gain
     return audio.astype(np.float32)
 
@@ -927,14 +913,33 @@ def reid_worker(cam_id):
 # ── Inferencia YOLO en thread por cámara ───────────────────────────────────────
 frame_cnt = {'csi': 0, 'usb': 0}
 infer_locks = {'csi': threading.Lock(), 'usb': threading.Lock()}
-_DET_LOG_INTERVAL = 30.0  # segundos mínimos entre logs DB de la misma detección
-_det_last_ts: dict = {}   # (cam_id, track_id|class) -> time.time()
 # Serializa Pose (YOLO-pose TRT) e InsightFace (onnxruntime-gpu) — ambos en GPU device 0.
 # Sin esto, los dos pueden ejecutar simultáneamente desde threads distintos y
 # generar conflictos de CUDA streams que terminan en segfault.
 gpu_infer_lock = threading.Lock()
 
 fps_timer = {}
+# Watchdog de inferencia: si llegan frames de la cámara pero infer_loop no
+# logra completar un ciclo en _infer_stall_timeout segundos (visto tras un
+# RuntimeError de CUDA/allocator no capturado que mataba el thread en
+# silencio — la cámara seguía "up" pero fps quedaba en 0 para siempre),
+# se fuerza el reinicio del proceso completo para reinicializar el contexto CUDA.
+_infer_last_ok_ts = {'csi': time.time(), 'usb': time.time()}
+_infer_stall_timeout = 30
+
+def _infer_watchdog():
+    while running:
+        time.sleep(5)
+        now = time.time()
+        for cam_id in ('csi', 'usb'):
+            with lock:
+                has_frame = frames.get(cam_id) is not None
+            if has_frame and now - _infer_last_ok_ts[cam_id] > _infer_stall_timeout:
+                print(f"[INFER] {cam_id}: watchdog — hay frames pero sin inferencia "
+                      f"completada por {_infer_stall_timeout}s, forzando reinicio del proceso",
+                      flush=True)
+                os._exit(1)
+
 def infer_loop(cam_id):
     fps_t = {"t": time.time(), "cnt": 0}
     enc_params = [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY]
@@ -945,6 +950,13 @@ def infer_loop(cam_id):
             time.sleep(0.01)
             continue
 
+        try:
+            _infer_loop_body(cam_id, frame, fps_t, enc_params)
+        except Exception as e:
+            print(f"[INFER] {cam_id}: error no capturado en ciclo de inferencia: {e}", flush=True)
+            time.sleep(0.5)  # evitar busy-loop si el error es persistente (ej. CUDA corrupto)
+
+def _infer_loop_body(cam_id, frame, fps_t, enc_params):
         # Un solo resize: INFER == STREAM, misma resolución
         infer_frame  = cv2.resize(frame, (INFER_W, INFER_H))
         stream_frame = infer_frame.copy()
@@ -981,14 +993,10 @@ def infer_loop(cam_id):
                           (sx1+lsz[0], ly+base-10), color, cv2.FILLED)
             cv2.putText(stream_frame, lbl, (sx1, ly-7),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1)
-            _det_key = (cam_id, track_id if track_id >= 0 else name)
-            _det_now = time.time()
-            if _det_now - _det_last_ts.get(_det_key, 0) >= _DET_LOG_INTERVAL:
-                _det_last_ts[_det_key] = _det_now
-                batch.append({"timestamp": ts, "type": "detection", "cam": cam_id,
-                              "class": name, "confidence": round(conf, 3),
-                              "track_id": track_id,
-                              "bbox": [int(xmin), int(ymin), int(xmax), int(ymax)]})
+            batch.append({"timestamp": ts, "type": "detection", "cam": cam_id,
+                          "class": name, "confidence": round(conf, 3),
+                          "track_id": track_id,
+                          "bbox": [int(xmin), int(ymin), int(xmax), int(ymax)]})
 
         frame_cnt[cam_id] += 1
         fps_t["cnt"] += 1
@@ -1048,6 +1056,7 @@ def infer_loop(cam_id):
         dashboard.update_frame(cam_id, jpeg.tobytes())
 
         db.write_events(batch)
+        _infer_last_ok_ts[cam_id] = time.time()
 
 # ── HUD audio ─────────────────────────────────────────────────────────────────
 def draw_audio_hud(frame):
@@ -1099,7 +1108,7 @@ def compose_loop():
 # ── Reporte diario ────────────────────────────────────────────────────────────
 def _build_daily_report(date_str: str) -> str:
     """Lee metadata de las últimas 24h y genera reporte con Claude."""
-    from openai import OpenAI as _OpenAI
+    import anthropic as _ant
     from collections import Counter as _C
     cutoff = (datetime.datetime.now(CST) - datetime.timedelta(hours=24)).isoformat()
     records = db.events_in_range(cutoff)
@@ -1139,9 +1148,9 @@ def _build_daily_report(date_str: str) -> str:
         f"Palabras clave detectadas: {kw_summary}\n"
         f"Transcripciones del día:\n{tx_summary}"
     )
-    client = _OpenAI(base_url=os.environ.get('NEMOTRON_URL', 'http://localhost:8003/v1'), api_key="none")
-    resp = client.chat.completions.create(
-        model="nemotron-omni",
+    client = _ant.Anthropic()
+    resp = client.messages.create(
+        model="claude-haiku-4-5-20251001",
         max_tokens=1200,
         messages=[{"role": "user", "content": (
             "Genera un reporte diario conciso de un sistema de videovigilancia. "
@@ -1150,7 +1159,7 @@ def _build_daily_report(date_str: str) -> str:
             "Responde en español.\n\nDatos:\n" + ctx
         )}]
     )
-    return resp.choices[0].message.content
+    return resp.content[0].text
 
 def send_daily_report():
     """Genera y envía el reporte diario a Telegram."""
@@ -1183,9 +1192,8 @@ def report_loop():
 
 def db_rotate_loop():
     while running:
-        time.sleep(1800)  # cada 30 min
+        time.sleep(METADATA_ROTATE_CHECK_S)
         db.rotate_if_needed(METADATA_ROTATE_MB)
-        db.purge_detections(keep=50_000)
 
 # ── Lanzar threads ─────────────────────────────────────────────────────────────
 # Registrar callback de mute (set_mic_muted ya está definida)
@@ -1193,10 +1201,16 @@ dashboard.set_mic_muted_fn(set_mic_muted)
 threading.Thread(target=report_loop,    daemon=True).start()
 threading.Thread(target=db_rotate_loop, daemon=True).start()
 threading.Thread(target=capture_csi,  daemon=True).start()
+# Delay antes de abrir USB (V4L2): evita condición de carrera con la sesión
+# Argus/GStreamer de CSI arrancando en paralelo, que puede hacer fallar
+# CaptureSession de uno de los dos pipelines o dejar cap.read() bloqueado
+# indefinidamente sin retornar ni True ni False.
+time.sleep(3)
 threading.Thread(target=capture_usb,  daemon=True).start()
 threading.Thread(target=audio_loop,   daemon=True).start()
 threading.Thread(target=infer_loop,   args=('csi',), daemon=True).start()
 threading.Thread(target=infer_loop,   args=('usb',), daemon=True).start()
+threading.Thread(target=_infer_watchdog, daemon=True).start()
 threading.Thread(target=reid_worker,  args=('csi',), daemon=True).start()
 threading.Thread(target=reid_worker,  args=('usb',), daemon=True).start()
 threading.Thread(target=compose_loop, daemon=True).start()

@@ -86,7 +86,7 @@ v4l2-ctl --list-devices
 ### 2. Clonar el repo
 
 ```bash
-git clone https://github.com/OXMtech/oxm-vision.git
+git clone https://github.com/Oxm-Tech/oxm-vision.git
 cd oxm-vision
 ```
 
@@ -115,22 +115,28 @@ yolo export model=yolo26s.pt format=engine half=True device=0
 
 > ⚠️ Los `.engine` son específicos del hardware donde se compilan. **No se pueden copiar entre máquinas.**
 
-### 5. Estructura de carpetas runtime
+### 5. Archivos que NO están en el repo (pesados o propietarios)
+
+| Archivo | Dónde ponerlo | Notas |
+|---|---|---|
+| `onnxruntime_gpu-1.23.0-cp312-cp312-linux_aarch64.whl` | raíz del repo | No existe wheel oficial para aarch64/Py3.12/CUDA 12.8: hay que **compilarlo desde fuente (~3 h)**. El `Dockerfile` lo copia. |
+| `yamnet.tflite` | `assets/` | Modelo YAMNet en formato TFLite (521 clases de audio). |
+| `yolo26s.engine`, `yolov8s-pose.engine` | `yolo/` | Se compilan en la propia Jetson (paso 4). |
+
+### 6. Estructura de carpetas runtime
 
 ```bash
-mkdir -p data/audio_clips data/metadata_archive data/event_clips
-mkdir -p models/insightface models/whisper_cache
-touch data/unified_metadata.jsonl data/face_db.pkl
+mkdir -p data/audio_clips data/face_snaps models/insightface models/whisper_cache
+touch data/events.db data/events.db-shm data/events.db-wal data/face_db.pkl
 ```
 
-### 6. Build + arrancar
+### 7. Build + arrancar
 
 ```bash
-# CRÍTICO: reiniciar nvargus-daemon antes (la CSI camera falla si no)
-sudo systemctl restart nvargus-daemon && sleep 3
-
-docker compose up -d --build
-docker compose logs -f
+# run-container.sh reinicia nvargus-daemon (obligatorio para la CSI) y levanta el stack
+./run-container.sh            # up (idempotente)
+./run-container.sh restart    # down + nvargus + up limpio
+./run-container.sh logs
 ```
 
 Abre el dashboard:
@@ -152,9 +158,14 @@ http://<IP_DE_LA_JETSON>:8080
 | `/api/stats` | JSON con personas, audio, alertas |
 | `/api/tegra` | Telemetría GPU/CPU/RAM/NVMe |
 | `/api/health` | Latido de cámaras, modelos y audio |
-| `/api/chat` | POST `{"q":"qué pasó ayer..."}` — respuesta natural con LLM |
-| `/api/report/pdf` | Descarga PDF del día actual |
-| `/api/clip/<id>` | Stream de un clip de audio guardado |
+| `/api/chat` | POST `{"question":"qué pasó ayer..."}` — respuesta en lenguaje natural (LLM en `NEMOTRON_URL`) |
+| `/api/persons` | Personas re-identificadas (con foto, cámaras y último avistamiento) |
+| `/api/audio/list` | Clips de audio con transcripción y hablantes |
+| `/api/audio/mute` | POST — silencia/activa el micrófono |
+| `/api/report/pdf` | Descarga el reporte PDF del día |
+| `/api/report/now` | POST — envía el reporte del día a Telegram |
+| `/audio/<archivo>` · `/face_snap/<uuid>` | Clip de audio / foto de una persona |
+| `/static/chart.js` | Chart.js servido localmente (el dashboard no depende de internet) |
 
 ### Enrolar caras conocidas
 
@@ -197,13 +208,28 @@ El keepalive del stream nunca debe emitir un JPEG vacío (`Content-Type: image/j
 No existe wheel oficial. Hay que compilar desde fuente (~3h) o aceptar CPU para InsightFace. Este repo usa onnxruntime-gpu cuando está disponible y cae a CPU si no.
 
 ### 🔧 nvargus-daemon hay que reiniciarlo antes de levantar el container
-Si no, el pipeline CSI muere con `Argus context not initialized`. El `Dockerfile` y `docker-compose.yml` no lo arreglan — hay que hacerlo manualmente cada vez que se reinicia la Jetson.
+Si no, el pipeline CSI muere con `Argus context not initialized`. `./run-container.sh` ya lo hace (up/restart); si levantas con `docker compose` a mano, reinicia `nvargus-daemon` primero.
 
 ### 🔧 `model.to('cuda')` con TensorRT engines
 **No usar.** Los `.engine` ya están en GPU; llamar `.to('cuda')` rompe la inferencia silenciosamente. Solo aplica a `.pt`.
 
 ### 🔧 Whisper en CPU intencionalmente
 Whisper en GPU compite con YOLO+InsightFace por memoria y compute. `device="cpu"` + `compute_type="int8"` da calidad equivalente en este caso de uso (transcripciones cortas de ~10s).
+
+### 🔧 Watchdogs: la cámara "viva" que no entrega video
+Tres fallas distintas que dejaban el sistema en zombie (cámara `up` pero 0 FPS, sin ningún error en logs):
+1. `cap.read()` de la USB se cuelga sin retornar → watchdog por **última lectura** (15 s).
+2. La USB falla de forma intermitente: nunca llega a 10 fallos seguidos ni se cuelga del todo → watchdog por **último frame útil** (`_usb_last_good_frame_ts`, 20 s).
+3. Un `RuntimeError` de CUDA (`NVML_SUCCESS == r INTERNAL ASSERT FAILED`) mataba en silencio el hilo `infer_loop` → `try/except` por ciclo + watchdog de **inferencia completada** (30 s).
+
+Los tres hacen `os._exit(1)` y Docker (`restart: unless-stopped`) relanza el proceso con un contexto CUDA limpio.
+
+### 🔧 Energía y reinicios abruptos de la Jetson
+Reinicios sin cierre limpio cada 1–4 semanas, sin rastro de panic ni OOM: patrón de *brownout* (la fuente no sostiene los picos).
+- El modo `MAXN_SUPER` es el de **máximo consumo**; se pasó a **15W** (`sudo nvpmodel -m 0`).
+- **Nunca cambies el modo de energía con el pipeline corriendo**: la CSI entra en un crash-loop de decenas de miles de reconexiones. Tras cambiarlo, reinicia `nvargus-daemon` y el container.
+- Activa el **journal persistente** (`Storage=persistent` en `/etc/systemd/journald.conf` y `/var/log/journal` con grupo `systemd-journal` + setgid); si no, cada reinicio borra la evidencia del crash.
+- Si arranca en modo texto en vez de escritorio: `sudo systemctl set-default graphical.target`.
 
 ---
 
@@ -217,8 +243,10 @@ oxm-vision/
 │   ├── face_reid.py       # InsightFace wrapper con FAISS
 │   ├── pose.py            # YOLOv8s-Pose + lógica de fall detection
 │   ├── db.py              # SQLite WAL helper
-│   ├── enroll_live.py     # CLI para enrolar caras desde stream en vivo
-│   └── event_recorder.py  # Buffer circular para guardar clips de eventos
+│   ├── csi_worker.py      # Subproceso aislado para la cámara CSI (Argus/GStreamer)
+│   └── enroll_live.py     # CLI para enrolar caras desde stream en vivo
+├── assets/                  # logo, Chart.js local, etiquetas de YAMNet
+├── run-container.sh         # up / restart / down / logs (reinicia nvargus-daemon)
 ├── scripts/
 │   └── setup-jetson-nat.sh  # Compartir internet Mac → Jetson por Ethernet
 ├── docs/                    # (futuro) diagramas, arquitectura, troubleshooting

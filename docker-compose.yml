@@ -12,41 +12,48 @@ services:
         max-size: "50m"
         max-file: "5"
     devices:
-      # Ajustar según los nodos /dev/video* asignados por v4l2-ctl --list-devices
-      - /dev/video0:/dev/video0  # USB Webcam (puede variar)
-      - /dev/video2:/dev/video2  # CSI IMX219 (puede variar)
+      # Ajustar según `v4l2-ctl --list-devices` (los números cambian al reconectar)
+      - /dev/video0:/dev/video0
+      - /dev/video1:/dev/video1
+      - /dev/video2:/dev/video2
       - /dev/snd:/dev/snd
     volumes:
-      # Modelos YOLO (.engine compilado en host)
+      - /dev/v4l:/dev/v4l:ro
+
+      # Modelos YOLO (.engine compilado en ESTA Jetson; no es portable)
       - ${YOLO_DIR:-./yolo}:/yolo:ro
 
-      # Datos runtime (persisten entre rebuilds)
+      # Datos runtime (persisten entre rebuilds). Crear antes con `touch` los archivos.
       - ${DATA_DIR:-./data}/audio_clips:/app/audio_clips
-      - ${DATA_DIR:-./data}/unified_metadata.jsonl:/app/unified_metadata.jsonl
-      - ${DATA_DIR:-./data}/metadata_archive:/app/metadata_archive
-      - ${DATA_DIR:-./data}/event_clips:/app/event_clips
+      - ${DATA_DIR:-./data}/events.db:/app/events.db
+      - ${DATA_DIR:-./data}/events.db-shm:/app/events.db-shm
+      - ${DATA_DIR:-./data}/events.db-wal:/app/events.db-wal
+      - ${DATA_DIR:-./data}/face_snaps:/app/face_snaps
       - ${DATA_DIR:-./data}/face_db.pkl:/app/face_db.pkl
 
-      # Socket de NVIDIA Argus (CSI camera)
+      # Socket de NVIDIA Argus (cámara CSI)
       - /tmp/argus_socket:/tmp/argus_socket
 
-      # Código fuente (hot-reload sin rebuild)
+      # Código fuente (editable sin rebuild)
       - ./src/main.py:/app/main.py
       - ./src/dashboard.py:/app/dashboard.py
       - ./src/face_reid.py:/app/face_reid.py
       - ./src/pose.py:/app/pose.py
       - ./src/db.py:/app/db.py
-      - ./src/event_recorder.py:/app/event_recorder.py
-      - ./assets/logo-oxmtech.png:/app/logo-oxmtech.png
+      - ./src/csi_worker.py:/app/csi_worker.py
 
-      # Libs del host (necesarias para GStreamer + NVIDIA en JetPack)
+      # Assets
+      - ./assets/logo-oxmtech.png:/app/logo-oxmtech.png
+      - ./assets/chart.umd.min.js:/app/chart.umd.min.js
+      - ./assets/yamnet.tflite:/app/yamnet.tflite
+      - ./assets/yamnet_labels.txt:/app/yamnet_labels.txt
+
+      # Libs del host (GStreamer + NVIDIA en JetPack)
       - /usr/lib/aarch64-linux-gnu/gstreamer-1.0:/usr/lib/aarch64-linux-gnu/gstreamer-1.0
       - /usr/lib/aarch64-linux-gnu/nvidia:/usr/lib/aarch64-linux-gnu/host-nvidia
 
-      # Modelos InsightFace (descarga inicial automática)
+      # Modelos InsightFace y cache de Whisper/HuggingFace
       - ${INSIGHTFACE_DIR:-./models/insightface}:/root/.insightface
-
-      # Cache de Whisper / HuggingFace
       - ${WHISPER_CACHE:-./models/whisper_cache}:/root/.cache/huggingface
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
@@ -58,4 +65,5 @@ services:
       - "TELEGRAM_TOKEN=${TELEGRAM_TOKEN:-}"
       - "TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}"
       - "REPORT_HOUR_CST=${REPORT_HOUR_CST:-8}"
+      - "NEMOTRON_URL=${NEMOTRON_URL:-http://localhost:8003/v1}"
     command: bash -c "sleep 5 && python3 main.py"

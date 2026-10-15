@@ -18,10 +18,11 @@ SKELETON = [
 ]
 
 KP_CONF_MIN  = 0.30
-FALL_ANGLE   = 60.0   # degrees from vertical
+FALL_ANGLE   = 65.0   # degrees from vertical (subir a 65 reduce FP de agachamiento)
 STAND_ANGLE  = 40.0
-FALL_HOLD_S  = 1.2
+FALL_HOLD_S  = 1.8    # segundos que debe mantenerse horizontal — agacharse es breve
 COOLDOWN_S   = 15.0
+GROUND_RATIO = 0.40   # max gap vertical cadera-tobillo / bbox_h para considerar "en el piso"
 
 
 def _torso_angle(kpts, kconf):
@@ -38,6 +39,37 @@ def _bbox_ratio(bbox):
     x1, y1, x2, y2 = bbox
     w, h = max(1, x2 - x1), max(1, y2 - y1)
     return w / h
+
+
+def _is_on_ground(kpts, kconf, bbox):
+    """
+    Verifica que la persona esté en el piso (no solo agachada).
+    Si los tobillos son visibles y el gap vertical cadera-tobillo es grande
+    relativo a la altura del bbox, la persona está de pie/agachada, no en el piso.
+    Devuelve True si parece estar en el piso o si no hay suficientes keypoints
+    para determinarlo (en ese caso no bloqueamos).
+    """
+    hip_vis = kconf[L_HIP] >= KP_CONF_MIN and kconf[R_HIP] >= KP_CONF_MIN
+    ank_vis = kconf[L_ANK] >= KP_CONF_MIN or kconf[R_ANK] >= KP_CONF_MIN
+
+    if not hip_vis or not ank_vis:
+        # Sin información suficiente — no bloqueamos la detección
+        return True
+
+    hip_y = (kpts[L_HIP][1] + kpts[R_HIP][1]) * 0.5
+
+    ank_ys = []
+    if kconf[L_ANK] >= KP_CONF_MIN:
+        ank_ys.append(kpts[L_ANK][1])
+    if kconf[R_ANK] >= KP_CONF_MIN:
+        ank_ys.append(kpts[R_ANK][1])
+    ankle_y = float(np.mean(ank_ys))
+
+    bbox_h = max(1, bbox[3] - bbox[1])
+    gap = abs(ankle_y - hip_y) / bbox_h
+
+    # Gap grande → tobillos muy por debajo de caderas → persona de pie o agachada
+    return gap < GROUND_RATIO
 
 
 class PoseFall:
@@ -76,15 +108,21 @@ class PoseFall:
 
         now = time.time()
         for i in range(len(boxes)):
-            bbox = boxes[i].tolist()
-            kpts = kpts_all[i]
+            bbox  = boxes[i].tolist()
+            kpts  = kpts_all[i]
             kconf = kconf_all[i]
             tid   = int(ids[i])
             ang   = _torso_angle(kpts, kconf)
             ratio = _bbox_ratio(bbox)
-            # Caída: requiere keypoints visibles + torso horizontal.
-            # bbox ratio sirve solo como confirmación (no dispara por sí solo).
-            horizontal = (ang is not None) and (ang > FALL_ANGLE) and (ratio > 1.0)
+
+            # Caída real: torso horizontal + bbox horizontal + cuerpo en el piso.
+            # _is_on_ground rechaza a personas agachadas verificando gap cadera-tobillo.
+            horizontal = (
+                ang is not None and
+                ang > FALL_ANGLE and
+                ratio > 1.0 and
+                _is_on_ground(kpts, kconf, bbox)
+            )
 
             key = (cam_id, tid)
             st  = self.state.get(key, {"since": None, "alerted": 0.0})
@@ -127,18 +165,15 @@ class PoseFall:
         for r in results:
             kpts, kconf = r["kpts"], r["kconf"]
             color = (0, 0, 255) if r["fall_now"] else (0, 255, 180)
-            # skeleton
             for a, b in SKELETON:
                 if kconf[a] < KP_CONF_MIN or kconf[b] < KP_CONF_MIN:
                     continue
                 pa = tuple(map(int, kpts[a]))
                 pb = tuple(map(int, kpts[b]))
                 cv2.line(frame, pa, pb, color, 2)
-            # keypoints
             for i in range(len(kpts)):
                 if kconf[i] < KP_CONF_MIN: continue
                 cv2.circle(frame, tuple(map(int, kpts[i])), 3, color, -1)
-            # bbox if fall
             if r["fall_now"]:
                 x1, y1, x2, y2 = r["bbox"]
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
